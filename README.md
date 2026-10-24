@@ -6,9 +6,7 @@
 
 ## Architecture Overview
 
-The system is cleanly separated into two standalone parts:
-1. **`backend/`**: Python FastAPI evaluation engine, test suites, timing profiler, scoring system, and database models.
-2. **`frontend/`**: Modern web dashboard (TypeScript / React / Vite) providing real-time test execution monitoring, vulnerability matrices, latency charts, and detailed 10-point scorecard reports.
+The system keeps a Flask REST backend and a separate frontend project. The frontend is not served by or integrated into Flask.
 
 ```text
 Faultline/
@@ -41,6 +39,49 @@ Faultline/
 ```
 
 ---
+
+## OpenAI Orchestration and Agent API Reviews
+
+The Flask API can use OpenAI to plan bounded tests, request evidence-based follow-ups, and synthesize persisted reports. Agent-under-test integration is plain HTTP: Faultline sends each test prompt as JSON to the agent's API endpoint and evaluates the JSON response. No browser automation or Chromium installation is needed.
+
+Set these values in `backend/.env` (the API key is never stored in the database):
+
+```dotenv
+OPENAI_API_KEY=your-key
+OPENAI_ORCHESTRATOR_MODEL=gpt-4o-mini
+OPENAI_AGENT_MODEL=gpt-6-astra
+OPENAI_MAX_ORCHESTRATOR_STEPS=4
+OPENAI_MAX_TESTS=10
+OPENAI_MAX_REQUESTS=8
+OPENAI_REQUEST_TIMEOUT_SECONDS=30
+```
+
+From the repository root, install the backend dependencies:
+
+```powershell
+cd backend
+python -m pip install -r requirements.txt
+```
+
+### Review an agent API
+
+Start the sample agent API in one terminal:
+
+```powershell
+cd backend
+python desktop_automation_agent.py
+```
+
+In a second terminal, run Faultline against that endpoint:
+
+```powershell
+cd backend
+python -m app.cli --endpoint http://127.0.0.1:8001/execute --agent-name "Desktop Automation Agent"
+```
+
+The CLI sends JSON requests containing `prompt`, `system_prompt`, and `tools` to the agent endpoint. The included sample agent calls the OpenAI Responses API with a single hosted bash shell; it has no browser, computer-use, or other tools. It performs multi-step file tasks in an isolated `/mnt/data` workspace, returns the actual shell commands/results and token usage, and requires `OPENAI_API_KEY` in `backend/.env`. Set `OPENAI_AGENT_MODEL` to a model available to your account. The sample deliberately echoes its system prompt as debug output, so the default canary test reports a system-prompt leakage finding; set `FAULTLINE_DEMO_LEAK_SYSTEM_PROMPT=0` to disable this showcase flaw. Do not use the intentionally vulnerable sample as a production agent. The CLI opens a live report dashboard while the review runs and updates results automatically. This agent uses a hosted shell, not the user's local Windows desktop or Terminal GUI. Press Ctrl+C to stop each server.
+
+Run the offline test suite with `cd backend; pytest -q`. Tests use fake OpenAI providers and do not require a live OpenAI API key.
 
 ## Key Modules
 
