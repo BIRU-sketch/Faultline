@@ -1,5 +1,6 @@
+import json
 import uuid
-from flask import Blueprint, request, jsonify, current_app
+from flask import Blueprint, request, jsonify, current_app, Response, stream_with_context
 from pydantic import ValidationError
 
 from ...db.session import SessionScoped
@@ -12,6 +13,7 @@ from ...schemas.run_result import (
 from ...security import get_security_test
 from ...benchmarks import get_benchmark_test
 from ...core.runner import TestRunner, request_run_cancellation
+from ...core.events import event_bus, format_sse
 
 runs_bp = Blueprint("runs", __name__)
 
@@ -255,3 +257,56 @@ def cancel_run(run_id: str):
         "active_worker_signaled": cancelled,
         "status": "cancelled",
     }), 200
+
+
+@runs_bp.route("/<run_id>/stream", methods=["GET"])
+def stream_run(run_id: str):
+    """
+    Server-Sent Events stream of live progress and log events for a run.
+
+    Clients should use EventSource against this endpoint. Terminal events
+    (run_completed / run_failed / run_cancelled) end the stream.
+    """
+    session = SessionScoped()
+    r = session.query(RunModel).filter_by(id=run_id).first()
+    if not r:
+        return jsonify({"error": f"Run '{run_id}' not found."}), 404
+
+    def generate():
+        # Initial snapshot so the console has context immediately
+        snapshot = {
+            "type": "snapshot",
+            "run_id": run_id,
+            "ts": r.created_at.isoformat() if r.created_at else None,
+            "payload": {
+                "status": r.status,
+                "progress": (r.orchestration_metadata or {}).get("progress"),
+                "error_message": r.error_message,
+            },
+        }
+        yield format_sse(snapshot)
+
+        # If already finished, close after snapshot
+        if r.status in ("completed", "failed", "cancelled"):
+            yield format_sse({
+                "type": f"run_{r.status}",
+                "run_id": run_id,
+                "ts": r.completed_at.isoformat() if r.completed_at else None,
+                "payload": {
+                    "status": r.status,
+                    "overall_grade": r.overall_grade,
+                    "error_message": r.error_message,
+                },
+            })
+            return
+
+        for event in event_bus.subscribe(run_id):
+            yield format_sse(event)
+
+    headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+    return Response(stream_with_context(generate()), headers=headers)
