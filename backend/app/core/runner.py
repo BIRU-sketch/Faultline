@@ -12,6 +12,7 @@ from ..evaluators import RegexMatcherEvaluator, ScoringRulesEvaluator, LLMJudgeE
 from .timer import LatencyTimer
 from .grader import TenPointGrader
 from .orchestrator import OpenAIOrchestrator
+from .events import event_bus
 
 # Active cancellation registry
 _cancellation_flags: Dict[str, threading.Event] = {}
@@ -53,6 +54,13 @@ class TestRunner:
         self.scoring_evaluator = ScoringRulesEvaluator()
         self.llm_evaluator = LLMJudgeEvaluator()
 
+    def _emit(self, event_type: str, payload: Optional[Dict[str, Any]] = None) -> None:
+        """Publish a live console event for this run."""
+        try:
+            event_bus.publish(self.run_id, event_type, payload or {})
+        except Exception:
+            pass
+
     def start_async(self):
         """Spawns execution in a background thread."""
         with _lock:
@@ -91,39 +99,39 @@ class TestRunner:
                 run_record.status = "failed"
                 run_record.error_message = f"Agent '{run_record.agent_id}' not found in registry."
                 session.commit()
+                self._emit("run_failed", {"error": run_record.error_message})
                 return
 
-            # Update status to running
             run_record.status = "running"
             run_record.started_at = datetime.now(timezone.utc)
             session.commit()
+            self._emit("run_started", {
+                "agent_id": agent_record.id,
+                "agent_name": agent_record.name,
+                "adapter_type": agent_record.adapter_type,
+            })
+            self._emit("log", {"level": "info", "message": f"Run started against agent '{agent_record.name}'."})
 
-            # Enforce limits
             limits = run_record.limits or {}
             configured_test_limit = int(self.app.config.get("OPENAI_MAX_TESTS", 10)) if self.app else 10
             max_tests = min(int(limits.get("max_tests", 10)), 20, configured_test_limit)
             max_duration_seconds = min(int(limits.get("max_duration_seconds", 60)), 180)
             max_retries = min(int(limits.get("max_retries", 1)), 3)
 
-            # Resolve selected tests
             test_selection = run_record.test_selection or {}
             security_ids = test_selection.get("security", [])
             benchmark_ids = test_selection.get("benchmarks", [])
 
             tests_to_run: List[Dict[str, Any]] = []
-
-            # Add security tests
             for tid in security_ids:
                 t = get_security_test(tid)
                 if t:
                     tests_to_run.append(t)
-            # Add benchmark tests
             for tid in benchmark_ids:
                 t = get_benchmark_test(tid)
                 if t:
                     tests_to_run.append(t)
 
-            # Truncate to maximum permitted tests limit
             tests_to_run = tests_to_run[:max_tests]
             orchestrator_candidates = list(tests_to_run)
 
@@ -139,6 +147,8 @@ class TestRunner:
                 test_order=[{"id": test["id"], "title": test.get("title", test["id"]), "category": test.get("category", "security")} for test in tests_to_run],
             )
             if openai_key:
+                self._emit("planning", {"total_tests": len(tests_to_run)})
+                self._emit("log", {"level": "info", "message": "OpenAI orchestrator is planning the test sequence…"})
                 orchestrator_config = {**self.app.config, "OPENAI_MAX_RETRIES": max_retries}
                 orchestrator = OpenAIOrchestrator(config=orchestrator_config)
                 try:
@@ -163,14 +173,18 @@ class TestRunner:
                         total_tests=len(tests_to_run),
                         test_order=[{"id": test["id"], "title": test.get("title", test["id"]), "category": test.get("category", "security")} for test in tests_to_run],
                     )
+                    self._emit("log", {"level": "info", "message": f"Plan ready: {len(tests_to_run)} test(s) scheduled."})
                 except Exception as exc:
                     run_record.status = "failed"
                     run_record.error_message = f"OpenAI orchestration failed: {exc}"
                     run_record.completed_at = datetime.now(timezone.utc)
                     _update_run_progress(session, run_record, state="failed", current_test=None, error=str(exc))
+                    self._emit("log", {"level": "error", "message": f"Orchestration failed: {exc}"})
+                    self._emit("run_failed", {"error": str(exc)})
                     return
+            else:
+                self._emit("log", {"level": "info", "message": f"Executing {len(tests_to_run)} selected test(s)."})
 
-            # Instantiate agent adapter
             adapter: BaseAgentAdapter = get_adapter(
                 adapter_type=agent_record.adapter_type,
                 agent_id=agent_record.id,
@@ -184,14 +198,14 @@ class TestRunner:
             planned_round_end = len(tests_to_run)
             orchestration_steps = 1 if orchestrator else 0
             for test_index, test_def in enumerate(tests_to_run):
-                # Check for cancellation request
                 if cancel_event and cancel_event.is_set():
                     run_record.status = "cancelled"
                     run_record.error_message = "Run was cancelled by user request."
                     _update_run_progress(session, run_record, state="cancelled", current_test=None)
+                    self._emit("log", {"level": "warn", "message": "Cancellation requested — stopping run."})
+                    self._emit("run_cancelled", {"reason": "user_request"})
                     break
 
-                # Check duration limit
                 if (run_timer.elapsed_seconds() or 0.0) >= max_duration_seconds:
                     duration_exceeded = True
                     run_record.status = "failed"
@@ -199,9 +213,10 @@ class TestRunner:
                         f"Run exceeded configured maximum duration of {max_duration_seconds} seconds."
                     )
                     _update_run_progress(session, run_record, state="failed", current_test=None, error=run_record.error_message)
+                    self._emit("log", {"level": "error", "message": run_record.error_message})
+                    self._emit("run_failed", {"error": run_record.error_message})
                     break
 
-                # Execute test on agent
                 _update_run_progress(
                     session,
                     run_record,
@@ -210,6 +225,17 @@ class TestRunner:
                     total_tests=len(tests_to_run),
                     current_test={"id": test_def.get("id"), "title": test_def.get("title", test_def.get("id")), "category": test_def.get("category", "security"), "started_at": datetime.now(timezone.utc).isoformat()},
                 )
+                self._emit("test_started", {
+                    "test_id": test_def.get("id"),
+                    "title": test_def.get("title", test_def.get("id")),
+                    "category": test_def.get("category", "security"),
+                    "index": test_index + 1,
+                    "total": len(tests_to_run),
+                })
+                self._emit("log", {
+                    "level": "info",
+                    "message": f"[{test_index + 1}/{len(tests_to_run)}] Starting {test_def.get('category', 'security')}: {test_def.get('title', test_def.get('id'))}",
+                })
                 test_timer = LatencyTimer().start()
                 test_started_at = datetime.now(timezone.utc)
                 observation = adapter.execute_task(
@@ -220,7 +246,6 @@ class TestRunner:
                 test_latency = test_timer.stop()
                 test_completed_at = datetime.now(timezone.utc)
 
-                # Select and run evaluator
                 eval_method = test_def.get("evaluation_method", "scoring_rules")
                 obs_dict = observation.model_dump()
 
@@ -255,7 +280,6 @@ class TestRunner:
                     "test_id": test_def.get("id"),
                 }
 
-                # Persist TestResultModel immediately
                 test_result = TestResultModel(
                     id=str(uuid.uuid4()),
                     run_id=self.run_id,
@@ -294,6 +318,21 @@ class TestRunner:
                     current_test=None,
                     latest_result={"test_id": test_result.test_id, "test_title": test_result.test_title, "status": test_result.status, "summary": test_result.summary},
                 )
+                self._emit("test_completed", {
+                    "test_id": test_result.test_id,
+                    "title": test_result.test_title,
+                    "category": test_result.category,
+                    "status": test_result.status,
+                    "summary": test_result.summary,
+                    "latency_ms": test_result.latency_ms,
+                    "completed_tests": len(executed_results),
+                    "total_tests": len(tests_to_run),
+                })
+                level = "error" if test_result.status in ("failed", "error") else "info"
+                self._emit("log", {
+                    "level": level,
+                    "message": f"[{test_result.status.upper()}] {test_result.test_title} — {test_result.summary}",
+                })
 
                 if (orchestrator and test_index == planned_round_end - 1
                         and orchestration_steps < orchestrator.max_steps
@@ -325,8 +364,8 @@ class TestRunner:
                             total_tests=len(tests_to_run),
                             test_order=[{"id": test["id"], "title": test.get("title", test["id"]), "category": test.get("category", "security")} for test in tests_to_run],
                         )
+                        self._emit("log", {"level": "info", "message": f"Orchestrator scheduled {len(follow_ups)} follow-up test(s)."})
 
-            # Calculate grade and finalize run if not cancelled
             total_duration_ms = run_timer.stop()
             run_record.total_duration_ms = total_duration_ms
             run_record.completed_at = datetime.now(timezone.utc)
@@ -338,6 +377,8 @@ class TestRunner:
                 total_tests=len(tests_to_run),
                 current_test=None,
             )
+            if run_record.status == "running":
+                self._emit("log", {"level": "info", "message": "Finalizing grade and report…"})
 
             if run_record.status != "cancelled":
                 grade_report = self.grader.grade(executed_results)
@@ -365,7 +406,7 @@ class TestRunner:
                         [] if any(result.get("evidence", {}).get("token_usage") for result in executed_results)
                         else ["token usage"]
                     ),
-                "openai_retries": orchestrator.retries if orchestrator else 0,
+                    "openai_retries": orchestrator.retries if orchestrator else 0,
                 }
                 if orchestrator and not duration_exceeded:
                     try:
@@ -380,8 +421,7 @@ class TestRunner:
                         run_record.final_report = {"assessment": "OpenAI synthesis unavailable.", "error": str(exc), "evidence": report_context}
                 elif orchestrator:
                     run_record.final_report = {
-                        "assessment": "Evaluation stopped at the configured wall-clock limit; this report contains partial observations.",
-                        "findings": [], "remediations": [],
+                        "assessment": "Evaluation stopped at the configured wall-clock limit; this report is partial.",
                         "limitations": grade_report.limitations + ["OpenAI synthesis was skipped after the duration limit."],
                         "evidence": report_context,
                     }
@@ -400,6 +440,22 @@ class TestRunner:
                 total_tests=len(tests_to_run),
                 current_test=None,
             )
+            if run_record.status == "completed":
+                self._emit("log", {
+                    "level": "info",
+                    "message": f"Run completed. Overall grade: {run_record.overall_grade}/10",
+                })
+                self._emit("run_completed", {
+                    "overall_grade": run_record.overall_grade,
+                    "total_duration_ms": run_record.total_duration_ms,
+                    "completed_tests": len(executed_results),
+                })
+            elif run_record.status == "failed":
+                self._emit("run_failed", {"error": run_record.error_message})
+            elif run_record.status == "cancelled":
+                self._emit("run_cancelled", {"reason": run_record.error_message})
+
+            session.commit()
 
         except Exception as e:
             session.rollback()
@@ -410,6 +466,9 @@ class TestRunner:
                     run_record.error_message = f"Execution engine failure: {str(e)}"
                     run_record.completed_at = datetime.now(timezone.utc)
                     _update_run_progress(session, run_record, state="failed", current_test=None, error=str(e))
+                    self._emit("log", {"level": "error", "message": f"Execution engine failure: {e}"})
+                    self._emit("run_failed", {"error": str(e)})
+                    session.commit()
             except Exception:
                 pass
 

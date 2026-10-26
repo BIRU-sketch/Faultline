@@ -3,6 +3,7 @@ const query = new URLSearchParams(location.search);
 const runId = query.get("run_id");
 let pollTimer = null;
 let connectionRetries = 0;
+let eventSource = null;
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
 const formatDate = (value) => value ? new Date(value).toLocaleString() : "—";
 const score = (value) => value == null ? "—" : Number(value).toFixed(1);
@@ -26,12 +27,124 @@ function scheduleLoad(delay = 2500) {
   pollTimer = setTimeout(load, delay);
 }
 
+function closeStream() {
+  if (eventSource) {
+    eventSource.close();
+    eventSource = null;
+  }
+}
+
+function appendConsoleLine(level, message, ts) {
+  const panel = document.getElementById("live-console-body");
+  if (!panel) return;
+  const time = ts ? new Date(ts).toLocaleTimeString() : new Date().toLocaleTimeString();
+  const row = document.createElement("div");
+  row.className = `console-line console-${level || "info"}`;
+  row.innerHTML = `<span class="console-ts">${esc(time)}</span><span class="console-level">${esc((level || "info").toUpperCase())}</span><span class="console-msg">${esc(message)}</span>`;
+  panel.appendChild(row);
+  panel.scrollTop = panel.scrollHeight;
+}
+
+function updateConsoleMeta(text) {
+  const meta = document.getElementById("live-console-meta");
+  if (meta) meta.textContent = text;
+}
+
+function ensureLiveConsole() {
+  if (document.getElementById("live-console")) return;
+  const titleRow = app.querySelector(".report-title-row");
+  if (!titleRow) return;
+  const section = document.createElement("section");
+  section.id = "live-console";
+  section.className = "live-console panel";
+  section.innerHTML = `
+    <div class="live-console-head">
+      <div>
+        <div class="section-eyebrow">LIVE STREAM</div>
+        <h2>Console</h2>
+      </div>
+      <div class="live-console-status">
+        <span class="pulse"></span>
+        <span id="live-console-meta">Connecting…</span>
+      </div>
+    </div>
+    <div id="live-console-body" class="live-console-body" role="log" aria-live="polite"></div>
+  `;
+  titleRow.insertAdjacentElement("afterend", section);
+}
+
+function connectLiveStream() {
+  if (!runId || eventSource) return;
+  ensureLiveConsole();
+  const url = `/api/v1/runs/${encodeURIComponent(runId)}/stream`;
+  eventSource = new EventSource(url);
+
+  const handle = (event) => {
+    let data;
+    try { data = JSON.parse(event.data); } catch { return; }
+    const type = data.type || event.type;
+    const payload = data.payload || {};
+    const ts = data.ts;
+
+    if (type === "heartbeat") {
+      updateConsoleMeta("Live · connected");
+      return;
+    }
+    if (type === "snapshot") {
+      updateConsoleMeta(`Status: ${payload.status || "unknown"}`);
+      appendConsoleLine("info", `Snapshot · run status is ${payload.status || "unknown"}`, ts);
+      return;
+    }
+    if (type === "log") {
+      appendConsoleLine(payload.level || "info", payload.message || "", ts);
+      return;
+    }
+    if (type === "run_started") {
+      updateConsoleMeta("Running");
+      appendConsoleLine("info", `Connected to agent ${payload.agent_name || payload.agent_id}`, ts);
+      return;
+    }
+    if (type === "planning") {
+      updateConsoleMeta("Planning");
+      appendConsoleLine("info", "Orchestrator is planning the test sequence…", ts);
+      return;
+    }
+    if (type === "test_started") {
+      updateConsoleMeta(`Test ${payload.index || "?"}/${payload.total || "?"}`);
+      appendConsoleLine("info", `▶ ${payload.title || payload.test_id}`, ts);
+      return;
+    }
+    if (type === "test_completed") {
+      const level = ["failed", "error"].includes(payload.status) ? "error" : "info";
+      appendConsoleLine(level, `■ ${payload.status?.toUpperCase()} · ${payload.title || payload.test_id}`, ts);
+      return;
+    }
+    if (type === "run_completed" || type === "run_failed" || type === "run_cancelled") {
+      const label = type.replace("run_", "");
+      updateConsoleMeta(label.charAt(0).toUpperCase() + label.slice(1));
+      appendConsoleLine(type === "run_completed" ? "info" : "error", `Run ${label}${payload.overall_grade != null ? ` · grade ${payload.overall_grade}/10` : ""}`, ts);
+      closeStream();
+      scheduleLoad(800);
+      return;
+    }
+  };
+
+  ["snapshot", "log", "run_started", "planning", "test_started", "test_completed", "run_completed", "run_failed", "run_cancelled", "heartbeat", "message"].forEach((name) => {
+    eventSource.addEventListener(name, handle);
+  });
+
+  eventSource.onerror = () => {
+    updateConsoleMeta("Reconnecting…");
+  };
+}
+
 function renderWaiting(message, detail) {
   document.getElementById("crumb").textContent = "Review report";
   app.innerHTML = `<section class="waiting-state"><span class="loading-spinner" aria-hidden="true"></span><div class="section-eyebrow">LIVE REVIEW</div><h1>${esc(message)}</h1><p>${esc(detail)}</p><small>Connection attempts: ${connectionRetries + 1}</small></section>`;
 }
 
 function renderHome(data) {
+  closeStream();
   document.getElementById("crumb").textContent = "Reviews";
   const runs = data.runs || [];
   app.innerHTML = `<div class="eyebrow">AGENT ASSURANCE / OVERVIEW</div><div class="title-row"><div><h1>Reviews</h1><p class="subhead">Inspect recent agent security and capability evaluations.</p></div><span class="count-chip">${runs.length} recent</span></div>
@@ -79,6 +192,9 @@ function renderReport(report) {
     const stage = currentTest ? `Running: ${currentTest.title}` : progress.state === "planning" ? "Preparing the test plan" : progress.state === "finalizing" ? "Finalizing the score and report" : "Waiting for the next test";
     banner.innerHTML = `<span class="loading-spinner" aria-hidden="true"></span><div class="live-progress-copy"><b>Review in progress · ${completedTests}/${testTotal} tests complete</b><p>${esc(stage)}</p><small>${observedToolCalls} tool calls observed · ${failedToolCalls} tool calls failed or blocked · ${counts.failed || 0} test failure(s) recorded</small></div><div class="live-progress-track"><i style="width:${testTotal ? Math.min(100, completedTests / testTotal * 100) : 4}%"></i></div>`;
     app.querySelector(".report-title-row")?.insertAdjacentElement("afterend", banner);
+    connectLiveStream();
+  } else {
+    closeStream();
   }
   const scorePanel = app.querySelector(".score-panel");
   if (scorePanel && components.length) {
